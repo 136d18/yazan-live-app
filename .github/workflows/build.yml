@@ -1,6 +1,8 @@
-# Yazan Live: builds the app from the project file (project.txz) in this repo.
-# To update: upload a new project.txz and GitHub builds it on its own.
-# The app checks the latest release and updates itself.
+# Yazan Live: one upload updates everything.
+#   project.txz  -> builds the Android app (release) AND deploys the server (worker/worker.js inside it)
+#   worker.js    -> deploys the server only
+# Server deploy needs the repo secret CF_API_TOKEN (Cloudflare token, template "Edit Cloudflare Workers").
+# Optional: secret CF_ACCOUNT_ID, variable CF_WORKER_NAME (default yazan-live).
 name: Build Yazan Live
 
 on:
@@ -17,59 +19,175 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    env:
+      WORKER_NAME: ${{ vars.CF_WORKER_NAME || 'yazan-live' }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Unpack project
+      - name: What changed
+        id: plan
+        env:
+          BEFORE: ${{ github.event.before }}
         run: |
-          f=""; best=-1
-          for x in *.txz *.tar.xz; do
-            [ -f "$x" ] || continue
-            t=$(git log -1 --format=%ct -- "$x"); t=${t:-0}
-            if [ "$t" -gt "$best" ]; then best=$t; f="$x"; fi
-          done
-          if [ -z "$f" ]; then
-            echo "::error::project.txz not found in the repo. Upload it from the upload page."
-            exit 1
+          set -euo pipefail
+          # newest file (by commit time) whose name matches $1
+          newest() {
+            git ls-files | grep -E "$1" | while IFS= read -r f; do
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$f")" "$f"
+            done | sort -rn | sed -n '1p' | cut -f2-
+          }
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            changed=$(git ls-files)
+          elif [ -n "${BEFORE:-}" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            changed=$(git diff --name-only --diff-filter=AMR "$BEFORE" "$GITHUB_SHA")
+          else
+            changed=$(git ls-files)
           fi
-          echo "Project file: $f"
-          mkdir -p src && tar -xJf "$f" -C src
-          ls src/app/src/main/java/ps/yazan/live
+          echo "Changed in this push:"; echo "$changed" | sed 's/^/  /'
+          app=false; worker=false; wsrc=""
+          if echo "$changed" | grep -qE '\.(txz|tar\.xz)$'; then
+            f=$(newest '\.(txz|tar\.xz)$')
+            echo "Project file: $f"
+            mkdir -p src && tar -xJf "$f" -C src
+            app=true
+            if [ -f src/worker/worker.js ]; then worker=true; wsrc=src/worker/worker.js; fi
+          fi
+          if echo "$changed" | grep -qE '(^|/)worker[^/]*\.js$'; then
+            worker=true; wsrc=$(newest '(^|/)worker[^/]*\.js$')
+          fi
+          echo "app=$app worker=$worker ($wsrc)"
+          { echo "app=$app"; echo "worker=$worker"; echo "wsrc=$wsrc"; } >> "$GITHUB_OUTPUT"
+          if [ "$app" = false ] && [ "$worker" = false ]; then
+            echo "::notice::Nothing to build. Upload project.txz (app + server) or worker.js (server only)."
+          fi
 
+      # ---------------- server (Cloudflare Worker) ----------------
+      - name: Deploy server
+        id: worker
+        if: steps.plan.outputs.worker == 'true'
+        env:
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          WSRC: ${{ steps.plan.outputs.wsrc }}
+        run: |
+          set +e -u
+          say() { echo "status=$1" >> "$GITHUB_OUTPUT"; echo "detail=$2" >> "$GITHUB_OUTPUT"; }
+          mkdir -p wk && cp "$WSRC" wk/worker.js
+          ver=$(grep -oE 'const VER = "[^"]*"' wk/worker.js | head -1 | cut -d'"' -f2 || true)
+          echo "ver=${ver:-?}" >> "$GITHUB_OUTPUT"
+          # reject a cut/broken file before it reaches Cloudflare
+          cp wk/worker.js wk/check.mjs
+          if ! node --check wk/check.mjs; then
+            echo "::error::worker.js has a syntax error (file cut or damaged). Server NOT changed."
+            say fail "broken file"; exit 0
+          fi
+          if ! grep -q 'export default' wk/worker.js; then
+            echo "::error::worker.js is not a module worker. Server NOT changed."
+            say fail "not a worker"; exit 0
+          fi
+          if [ -z "${CF_API_TOKEN:-}" ]; then
+            echo "::warning::Secret CF_API_TOKEN is missing, so the server was NOT updated. Add it once (see the guide)."
+            say skip "no CF_API_TOKEN"; exit 0
+          fi
+          api=https://api.cloudflare.com/client/v4
+          auth="Authorization: Bearer $CF_API_TOKEN"
+          acc="${CF_ACCOUNT_ID:-}"
+          if [ -z "$acc" ]; then
+            acc=$(curl -sS -H "$auth" "$api/accounts?per_page=50" | jq -r '.result[0].id // empty')
+          fi
+          if [ -z "$acc" ]; then
+            acc=$(curl -sS -H "$auth" "$api/memberships" | jq -r '.result[0].account.id // empty')
+          fi
+          if [ -z "$acc" ]; then
+            echo "::error::Cloudflare did not accept the token (or it has no account access). Make a new token from the 'Edit Cloudflare Workers' template."
+            say fail "token"; exit 0
+          fi
+          # replaces only the code; the D1 binding (DB) and other settings stay as they are
+          resp=$(curl -sS -X PUT "$api/accounts/$acc/workers/scripts/$WORKER_NAME/content" \
+            -H "$auth" \
+            -F 'metadata={"main_module":"worker.js"};type=application/json' \
+            -F 'worker.js=@wk/worker.js;type=application/javascript+module')
+          echo "$resp" | jq '{success, errors, messages}' || echo "$resp" | head -c 2000
+          if [ "$(echo "$resp" | jq -r '.success' 2>/dev/null)" != "true" ]; then
+            echo "::error::Cloudflare refused the upload: $(echo "$resp" | jq -c '.errors' 2>/dev/null)"
+            say fail "upload refused"; exit 0
+          fi
+          # check the live site now reports the new version
+          sub=$(curl -sS -H "$auth" "$api/accounts/$acc/workers/subdomain" | jq -r '.result.subdomain // empty')
+          if [ -n "$sub" ] && [ -n "$ver" ]; then
+            url="https://$WORKER_NAME.$sub.workers.dev/api/ver"
+            for i in 1 2 3 4 5 6 7 8; do
+              live=$(curl -sS "$url" | jq -r '.ver // empty' 2>/dev/null || true)
+              echo "live version: ${live:-?}"
+              [ "$live" = "$ver" ] && break
+              sleep 5
+            done
+            if [ "$live" != "$ver" ]; then echo "::warning::Uploaded, but the site still shows ${live:-nothing} instead of $ver. Check it in a minute."; fi
+          fi
+          echo "::notice::Server updated to $ver"
+          say ok "$ver"
+
+      # ---------------- Android app ----------------
       - uses: actions/setup-java@v4
+        if: steps.plan.outputs.app == 'true'
         with:
           distribution: temurin
           java-version: '17'
 
       - uses: gradle/actions/setup-gradle@v4
+        if: steps.plan.outputs.app == 'true'
         with:
           gradle-version: '8.14.3'
 
       - name: Build app
+        if: steps.plan.outputs.app == 'true'
         working-directory: src
         run: gradle :app:assembleRelease --no-daemon --stacktrace
 
       - name: Prepare file
+        if: steps.plan.outputs.app == 'true'
         run: cp src/app/build/outputs/apk/release/app-release.apk YazanLive.apk
 
       - uses: actions/upload-artifact@v4
+        if: steps.plan.outputs.app == 'true'
         with:
           name: yazan-live-apk
           path: YazanLive.apk
 
       - name: Publish release
+        if: steps.plan.outputs.app == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          NOTES: ${{ github.event.head_commit.message }}
+          MSG: ${{ github.event.head_commit.message }}
+          WSTATUS: ${{ steps.worker.outputs.status }}
+          WVER: ${{ steps.worker.outputs.ver }}
         run: |
+          set -euo pipefail
+          if [ -s src/CHANGES.txt ]; then cp src/CHANGES.txt notes.txt; else echo "${MSG:-Manual build}" > notes.txt; fi
+          case "${WSTATUS:-}" in
+            ok)   printf '\nserver: %s OK\n' "$WVER" >> notes.txt ;;
+            skip) printf '\nserver: not updated (CF_API_TOKEN missing)\n' >> notes.txt ;;
+            fail) printf '\nserver: NOT updated (see Actions log)\n' >> notes.txt ;;
+          esac
           for t in $(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName'); do
             gh release delete "$t" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
           done
-          [ -n "$NOTES" ] || NOTES="Manual build"
           gh release create "v$GITHUB_RUN_NUMBER" YazanLive.apk -R "$GITHUB_REPOSITORY" \
             --title "Yazan Live 1.0.$GITHUB_RUN_NUMBER" \
-            --notes "$NOTES" \
+            --notes-file notes.txt \
             --target "$GITHUB_SHA" --latest
-            
+
+      - name: Result
+        if: always()
+        env:
+          APP: ${{ steps.plan.outputs.app }}
+          WSTATUS: ${{ steps.worker.outputs.status }}
+          WDETAIL: ${{ steps.worker.outputs.detail }}
+        run: |
+          echo "### Yazan Live" >> "$GITHUB_STEP_SUMMARY"
+          [ "$APP" = true ] && echo "- App: 1.0.$GITHUB_RUN_NUMBER built and published" >> "$GITHUB_STEP_SUMMARY"
+          [ -n "${WSTATUS:-}" ] && echo "- Server: ${WSTATUS} (${WDETAIL})" >> "$GITHUB_STEP_SUMMARY"
+          # a server-only upload that failed should show a red X
+          if [ "${WSTATUS:-}" = fail ]; then exit 1; fi
