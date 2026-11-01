@@ -1,0 +1,75 @@
+# Yazan Live: builds the app from the project file (project.txz) in this repo.
+# To update: upload a new project.txz and GitHub builds it on its own.
+# The app checks the latest release and updates itself.
+name: Build Yazan Live
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack project
+        run: |
+          f=""; best=-1
+          for x in *.txz *.tar.xz; do
+            [ -f "$x" ] || continue
+            t=$(git log -1 --format=%ct -- "$x"); t=${t:-0}
+            if [ "$t" -gt "$best" ]; then best=$t; f="$x"; fi
+          done
+          if [ -z "$f" ]; then
+            echo "::error::project.txz not found in the repo. Upload it from the upload page."
+            exit 1
+          fi
+          echo "Project file: $f"
+          mkdir -p src && tar -xJf "$f" -C src
+          ls src/app/src/main/java/ps/yazan/live
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Build app
+        working-directory: src
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Prepare file
+        run: cp src/app/build/outputs/apk/release/app-release.apk YazanLive.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yazan-live-apk
+          path: YazanLive.apk
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          for t in $(gh release list -R "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName'); do
+            gh release delete "$t" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          done
+          [ -n "$NOTES" ] || NOTES="Manual build"
+          gh release create "v$GITHUB_RUN_NUMBER" YazanLive.apk -R "$GITHUB_REPOSITORY" \
+            --title "Yazan Live 1.0.$GITHUB_RUN_NUMBER" \
+            --notes "$NOTES" \
+            --target "$GITHUB_SHA" --latest
+            
